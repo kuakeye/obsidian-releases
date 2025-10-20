@@ -18590,5 +18590,12 @@
     "author": "m",
     "description": "Streamlines note review by automatically navigating to the next note upon deletion. Adds commands to go to the previous and next note, respecting user-selected sort order.",
     "repo": "mudnug/note-navigator"
+  },
+  {
+  "id": "auto-node",
+  "name": "Auto Node", 
+  "author": "clarkye",
+  "description": "Automatically maintain MOC pages populated with links to notes mentioning a keyword.",
+  "repo": "kuakeye/obsidian-auto-node"
   }
 ]
