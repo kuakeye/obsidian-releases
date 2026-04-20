@@ -1,0 +1,128 @@
+name: Poll upstream submission PR
+
+# Polls obsidianmd/obsidian-releases PR #${{ vars.UPSTREAM_PR_NUMBER }} for new
+# comments and reviews, and kicks the Claude Code routine via its API trigger
+# when anything new appears since the last run.
+#
+# REQUIRED REPO CONFIG:
+#   - Variable UPSTREAM_PR_NUMBER    (Settings > Secrets and variables > Actions > Variables)
+#   - Secret   CLAUDE_ROUTINE_URL    (the POST URL from the routine's API trigger)
+#   - Secret   CLAUDE_ROUTINE_TOKEN  (the bearer token from the routine's API trigger)
+
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: poll-upstream-pr
+  cancel-in-progress: false
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check config
+        id: cfg
+        run: |
+          PR="${{ vars.UPSTREAM_PR_NUMBER }}"
+          if [ -z "$PR" ]; then
+            echo "::warning::UPSTREAM_PR_NUMBER repo variable is not set; skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "pr=$PR" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.cfg.outputs.skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Read last-seen timestamp
+        if: steps.cfg.outputs.skip != 'true'
+        id: state
+        run: |
+          if [ -f .github/poll-state.json ]; then
+            LAST=$(jq -r '.last_comment_at' .github/poll-state.json)
+            FIRST=false
+          else
+            LAST="1970-01-01T00:00:00Z"
+            FIRST=true
+          fi
+          echo "last=$LAST" >> "$GITHUB_OUTPUT"
+          echo "first=$FIRST" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch upstream PR activity
+        if: steps.cfg.outputs.skip != 'true'
+        id: fetch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ steps.cfg.outputs.pr }}
+          LAST: ${{ steps.state.outputs.last }}
+          FIRST: ${{ steps.state.outputs.first }}
+        run: |
+          REPO=obsidianmd/obsidian-releases
+          gh api "repos/$REPO/issues/$PR/comments" --paginate > issue.json   || echo "[]" > issue.json
+          gh api "repos/$REPO/pulls/$PR/comments"  --paginate > review.json  || echo "[]" > review.json
+          gh api "repos/$REPO/pulls/$PR/reviews"   --paginate > reviews.json || echo "[]" > reviews.json
+
+          LATEST=$(jq -rs '
+            flatten
+            | map(.updated_at // .submitted_at // .created_at)
+            | map(select(. != null))
+            | max // "1970-01-01T00:00:00Z"
+          ' issue.json review.json reviews.json)
+
+          if [ "$FIRST" = "true" ]; then
+            echo "First run — establishing baseline, not triggering routine."
+            NEW=0
+          else
+            NEW=$(jq -s --arg last "$LAST" '
+              flatten
+              | map(select((.updated_at // .submitted_at // .created_at) > $last))
+              | length
+            ' issue.json review.json reviews.json)
+          fi
+
+          echo "latest=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+          echo "last seen: $LAST | latest: $LATEST | new: $NEW"
+
+      - name: Trigger Claude routine
+        if: steps.cfg.outputs.skip != 'true' && steps.fetch.outputs.new != '0'
+        env:
+          ROUTINE_URL:   ${{ secrets.CLAUDE_ROUTINE_URL }}
+          ROUTINE_TOKEN: ${{ secrets.CLAUDE_ROUTINE_TOKEN }}
+          PR: ${{ steps.cfg.outputs.pr }}
+          NEW: ${{ steps.fetch.outputs.new }}
+        run: |
+          if [ -z "$ROUTINE_URL" ] || [ -z "$ROUTINE_TOKEN" ]; then
+            echo "::error::CLAUDE_ROUTINE_URL and CLAUDE_ROUTINE_TOKEN secrets are required."
+            exit 1
+          fi
+          BODY=$(jq -nc --arg pr "$PR" --arg n "$NEW" '{
+            message: ("Upstream PR obsidianmd/obsidian-releases#" + $pr + " has " + $n + " new comment(s)/review(s). Read them, fix anything actionable on kuakeye/obsidian-auto-node branch claude/obsidian-plugin-submission-HI2zT, bump manifest/versions/tag/release as needed, then reply on the PR summarizing what was addressed."),
+            pr_number: ($pr | tonumber),
+            pr_repo: "obsidianmd/obsidian-releases"
+          }')
+          curl --fail --silent --show-error -X POST "$ROUTINE_URL" \
+            -H "Authorization: Bearer $ROUTINE_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$BODY"
+
+      - name: Persist state
+        if: steps.cfg.outputs.skip != 'true' && (steps.fetch.outputs.new != '0' || steps.state.outputs.first == 'true')
+        env:
+          LATEST: ${{ steps.fetch.outputs.latest }}
+        run: |
+          mkdir -p .github
+          jq -n --arg ts "$LATEST" '{last_comment_at: $ts}' > .github/poll-state.json
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/poll-state.json
+          if ! git diff --staged --quiet; then
+            git commit -m "chore(routine): update poll state to $LATEST"
+            git push
+          fi
